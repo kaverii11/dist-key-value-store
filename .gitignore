@@ -1,0 +1,13 @@
+# Build artifacts
+*.exe
+*.test
+bin/
+
+# Runtime data (per-node WAL + raft state files)
+data/*
+!data/.gitkeep
+
+# Editor/OS
+.vscode/
+.idea/
+Thumbs.db
