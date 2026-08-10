@@ -15,9 +15,22 @@ type Store struct {
 // Open opens (or creates) the WAL at path, replays it to rebuild in-memory
 // state, and returns a ready-to-use Store.
 func Open(path string) (*Store, error) {
+	s, _, err := openAndReplay(path)
+	return s, err
+}
+
+// OpenForRaft is like Open, but also returns the replayed records so a
+// raft.Node can rebuild its in-memory log view (index/term per entry)
+// without re-parsing the WAL itself. Used for clustered nodes; standalone
+// use should call Open.
+func OpenForRaft(path string) (*Store, []Record, error) {
+	return openAndReplay(path)
+}
+
+func openAndReplay(path string) (*Store, []Record, error) {
 	wal, records, err := OpenWAL(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	s := &Store{data: make(map[string]string, len(records)), wal: wal}
 	for _, rec := range records {
@@ -28,7 +41,29 @@ func Open(path string) (*Store, error) {
 			delete(s.data, rec.Key)
 		}
 	}
-	return s, nil
+	return s, records, nil
+}
+
+// WAL exposes the underlying write-ahead log so the raft package can
+// append log entries directly (with leader/follower-assigned index/term)
+// to the same file this Store replays on startup — the "the raft log is
+// the storage WAL" unification described in the project plan.
+func (s *Store) WAL() *WAL { return s.wal }
+
+// Apply mutates the in-memory map only, without writing to the WAL. Used
+// by the raft layer to update the state machine once an entry it already
+// wrote to the (shared) WAL itself has been committed — as opposed to
+// Put/Delete, which own the whole WAL-then-map sequence for standalone,
+// non-clustered use.
+func (s *Store) Apply(rec Record) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch rec.Op {
+	case OpPut:
+		s.data[rec.Key] = rec.Value
+	case OpDelete:
+		delete(s.data, rec.Key)
+	}
 }
 
 // Get returns the value for key and whether it was present.

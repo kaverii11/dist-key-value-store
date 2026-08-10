@@ -60,3 +60,13 @@ func (c ClusterConfig) PeerClusterAddrs(selfID string) map[string]string {
 	}
 	return peers
 }
+
+// ClientAddrs returns id -> clientAddr for every node, including self —
+// used to resolve a LeaderHint to an address a client can redirect to.
+func (c ClusterConfig) ClientAddrs() map[string]string {
+	m := make(map[string]string, len(c.Nodes))
+	for _, n := range c.Nodes {
+		m[n.ID] = n.ClientAddr
+	}
+	return m
+}

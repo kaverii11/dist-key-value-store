@@ -1,14 +1,15 @@
 // cmd/node is the entrypoint for a cluster node: it wires the storage
-// engine, TCP transport, and Raft state machine together, and exposes the
-// store over a stdin REPL for manual demo interaction.
+// engine, TCP transport, Raft state machine, and client API together, and
+// exposes the store over a stdin REPL for manual demo interaction.
 //
-// Through M4, replication isn't wired yet (see internal/raft's package
-// doc), so put/get/delete here are local to this node only; M5 adds
-// leader-only writes with majority replication.
+// Writes and reads go through the same leader-only path a remote kvctl
+// client would use (internal/api.Server) — see the project plan's Design
+// Decisions for why reads are leader-only too in this project.
 package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/kaverii11/dist-key-value-store/internal/api"
 	"github.com/kaverii11/dist-key-value-store/internal/config"
 	"github.com/kaverii11/dist-key-value-store/internal/raft"
 	"github.com/kaverii11/dist-key-value-store/internal/store"
@@ -47,17 +49,19 @@ func main() {
 	walPath := filepath.Join(*dataDir, *id+".wal")
 	statePath := filepath.Join(*dataDir, *id+"-raftstate.json")
 
-	s, err := store.Open(walPath)
+	fsm, records, err := store.OpenForRaft(walPath)
 	if err != nil {
 		log.Fatalf("failed to open store at %s: %v", walPath, err)
 	}
-	defer s.Close()
+	defer fsm.Close()
 
 	node, err := raft.NewNode(raft.Params{
-		ID:         *id,
-		PeerAddrs:  cluster.PeerClusterAddrs(*id),
-		Transport:  transport.TCPTransport{},
-		StateStore: raft.NewStateStore(statePath),
+		ID:              *id,
+		PeerAddrs:       cluster.PeerClusterAddrs(*id),
+		Transport:       transport.TCPTransport{},
+		StateStore:      raft.NewStateStore(statePath),
+		Store:           fsm,
+		ReplayedRecords: records,
 	})
 	if err != nil {
 		log.Fatalf("failed to create raft node: %v", err)
@@ -69,13 +73,19 @@ func main() {
 	}
 	defer clusterSrv.Close()
 
+	apiSrv := api.NewServer(node, fsm, cluster.ClientAddrs())
+	clientSrv, err := transport.Listen(self.ClientAddr, apiSrv.Handle)
+	if err != nil {
+		log.Fatalf("failed to listen on client address %s: %v", self.ClientAddr, err)
+	}
+	defer clientSrv.Close()
+
 	node.Start()
 	defer node.Stop()
 
 	fmt.Printf("node %s ready — cluster:%s client:%s — %d key(s) recovered from %s\n",
-		*id, self.ClusterAddr, self.ClientAddr, s.Len(), walPath)
+		*id, self.ClusterAddr, self.ClientAddr, fsm.Len(), walPath)
 	fmt.Println("commands: put <key> <value> | get <key> | del <key> | status | quit")
-	fmt.Println("(replication lands in M5 — writes here are local to this node only)")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -95,8 +105,8 @@ func main() {
 				continue
 			}
 			key, value := fields[1], strings.Join(fields[2:], " ")
-			if err := s.Put(key, value); err != nil {
-				fmt.Printf("error: %v\n", err)
+			if err := apiSrv.Put(key, value); err != nil {
+				printClusterErr(node, cluster, err)
 				continue
 			}
 			fmt.Println("OK")
@@ -106,7 +116,12 @@ func main() {
 				fmt.Println("usage: get <key>")
 				continue
 			}
-			if v, ok := s.Get(fields[1]); ok {
+			v, found, err := apiSrv.Get(fields[1])
+			if err != nil {
+				printClusterErr(node, cluster, err)
+				continue
+			}
+			if found {
 				fmt.Println(v)
 			} else {
 				fmt.Println("(not found)")
@@ -117,14 +132,15 @@ func main() {
 				fmt.Println("usage: del <key>")
 				continue
 			}
-			if err := s.Delete(fields[1]); err != nil {
-				fmt.Printf("error: %v\n", err)
+			if err := apiSrv.Delete(fields[1]); err != nil {
+				printClusterErr(node, cluster, err)
 				continue
 			}
 			fmt.Println("OK")
 
 		case "status":
-			fmt.Printf("id=%s state=%s term=%d leader=%s\n", node.ID(), node.State(), node.CurrentTerm(), node.LeaderID())
+			fmt.Printf("id=%s state=%s term=%d leader=%s commitIndex=%d\n",
+				node.ID(), node.State(), node.CurrentTerm(), node.LeaderID(), node.CommitIndex())
 
 		case "quit", "exit":
 			return
@@ -133,4 +149,12 @@ func main() {
 			fmt.Printf("unknown command %q\n", fields[0])
 		}
 	}
+}
+
+func printClusterErr(node *raft.Node, cluster config.ClusterConfig, err error) {
+	if errors.Is(err, raft.ErrNotLeader) {
+		fmt.Printf("not leader (leader hint: %s)\n", node.LeaderAddr(cluster.ClientAddrs()))
+		return
+	}
+	fmt.Printf("error: %v\n", err)
 }

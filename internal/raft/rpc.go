@@ -40,7 +40,15 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    uint64 `json:"term"`
 	Success bool   `json:"success"`
-	// MatchIndex lets the leader advance nextIndex/matchIndex for this
-	// follower in one round trip on success, instead of inferring it.
-	MatchIndex uint64 `json:"matchIndex"`
+	// LastLogIndex is the follower's own last log index after processing
+	// this request, sent on both success and failure. On failure, it lets
+	// the leader jump nextIndex directly to where the follower actually
+	// is instead of decrementing one entry at a time — this is the
+	// "simplified decrement-and-retry" mentioned in the package doc; we
+	// don't implement the paper's binary-search-style conflict
+	// optimization, and (see package doc) we don't handle a follower
+	// whose log has diverged to be AHEAD of the leader's (e.g. a former
+	// leader rejoining with an entry it never got to replicate before
+	// crashing) — that case is explicitly out of scope.
+	LastLogIndex uint64 `json:"lastLogIndex"`
 }
