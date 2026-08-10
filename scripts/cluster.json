@@ -1,0 +1,7 @@
+{
+    "nodes": [
+        { "id": "node1", "clusterAddr": "127.0.0.1:7001", "clientAddr": "127.0.0.1:8001" },
+        { "id": "node2", "clusterAddr": "127.0.0.1:7002", "clientAddr": "127.0.0.1:8002" },
+        { "id": "node3", "clusterAddr": "127.0.0.1:7003", "clientAddr": "127.0.0.1:8003" }
+    ]
+}
