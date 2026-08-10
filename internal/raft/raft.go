@@ -712,6 +712,10 @@ func (n *Node) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		n.lastLogIndex = e.Index
 		n.lastLogTerm = e.Term
 	}
+	if len(args.Entries) > 0 {
+		log.Printf("[%s] term=%d appended %d log entries from %s (lastLogIndex now %d)",
+			n.id, n.currentTerm, len(args.Entries), args.LeaderID, n.lastLogIndex)
+	}
 
 	if args.LeaderCommit > n.commitIndex {
 		if args.LeaderCommit < n.lastLogIndex {
