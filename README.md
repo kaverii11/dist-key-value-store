@@ -28,6 +28,11 @@ Writes keep flowing at ~1,000/s. node2's lines stop while it is down, then jump
 back when it restarts at 15:14:02 and it catches up with the others. This run:
 41,417 acknowledged writes, 0 lost, longest gap 408 ms.*
 
+**Also on AWS EC2** (t3.small, Mumbai): the same chaos test gave 30,948 acknowledged
+writes, **0 lost**, a 561 ms failover and full convergence; k6 gave ~1,660 requests/s at
+p95 38 ms. Steps, the user-data script and a screenshot are in
+[`deploy/aws/`](deploy/aws/README.md).
+
 ## What the chaos test found
 
 The first version passed every unit test and the scripted demo, because the demo
