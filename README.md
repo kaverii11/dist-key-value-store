@@ -20,6 +20,14 @@ for exactly where the line is drawn.
 Numbers are from `scripts/chaos.sh` and `scripts/k6.sh` on Docker Desktop; they
 depend on the machine's fsync speed.
 
+![Grafana during a chaos run](docs/img/grafana-chaos.png)
+
+*One chaos run in Grafana: node2 (yellow) is the leader until it is killed at
+15:13:47; node1 (green) takes over and the term moves from 8 to 9 (one election).
+Writes keep flowing at ~1,000/s. node2's lines stop while it is down, then jump
+back when it restarts at 15:14:02 and it catches up with the others. This run:
+41,417 acknowledged writes, 0 lost, longest gap 408 ms.*
+
 ## What the chaos test found
 
 The first version passed every unit test and the scripted demo, because the demo

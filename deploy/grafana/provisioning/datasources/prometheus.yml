@@ -5,3 +5,5 @@ datasources:
     type: prometheus
     url: http://prometheus:9090
     isDefault: true
+    jsonData:
+      timeInterval: 2s   # matches the 2 s scrape interval, so graphs aren't coarser than the data
