@@ -13,21 +13,31 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
+	kvv1 "github.com/kaverii11/dist-key-value-store/gen/kv/v1"
 	"github.com/kaverii11/dist-key-value-store/internal/api"
 	"github.com/kaverii11/dist-key-value-store/internal/config"
+	"github.com/kaverii11/dist-key-value-store/internal/grpcapi"
+	"github.com/kaverii11/dist-key-value-store/internal/metrics"
 	"github.com/kaverii11/dist-key-value-store/internal/raft"
 	"github.com/kaverii11/dist-key-value-store/internal/store"
 	"github.com/kaverii11/dist-key-value-store/internal/transport"
+	"google.golang.org/grpc"
 )
 
 func main() {
 	configPath := flag.String("config", "scripts/cluster.json", "path to cluster config JSON")
 	id := flag.String("id", "", "this node's ID (must match an entry in the cluster config)")
 	dataDir := flag.String("data-dir", "data", "directory for this node's WAL and raft state files")
+	metricsAddr := flag.String("metrics-addr", "", "serve Prometheus /metrics and /healthz on this address, e.g. :2112 (off if empty)")
+	noREPL := flag.Bool("no-repl", false, "run without the stdin REPL (for containers); stop on SIGINT/SIGTERM")
 	flag.Parse()
 
 	if *id == "" {
@@ -67,21 +77,64 @@ func main() {
 		log.Fatalf("failed to create raft node: %v", err)
 	}
 
-	clusterSrv, err := transport.Listen(self.ClusterAddr, node.HandleMessage)
+	clusterSrv, err := transport.Listen(listenAddr(self.ClusterAddr), node.HandleMessage)
 	if err != nil {
 		log.Fatalf("failed to listen on cluster address %s: %v", self.ClusterAddr, err)
 	}
 	defer clusterSrv.Close()
 
 	apiSrv := api.NewServer(node, fsm, cluster.ClientAddrs())
-	clientSrv, err := transport.Listen(self.ClientAddr, apiSrv.Handle)
+	clientSrv, err := transport.Listen(listenAddr(self.ClientAddr), apiSrv.Handle)
 	if err != nil {
 		log.Fatalf("failed to listen on client address %s: %v", self.ClientAddr, err)
 	}
 	defer clientSrv.Close()
 
+	// gRPC client API (optional: only if this node has a grpcAddr in the config).
+	var mets *metrics.Metrics
+	if *metricsAddr != "" {
+		mets = metrics.New(node, fsm)
+	}
+	if self.GRPCAddr != "" {
+		var opts []grpc.ServerOption
+		if mets != nil {
+			opts = append(opts, grpc.UnaryInterceptor(mets.UnaryInterceptor))
+		}
+		gs := grpc.NewServer(opts...)
+		kvv1.RegisterKVServer(gs, grpcapi.New(apiSrv, node, fsm, cluster.GRPCAddrs()))
+		lis, err := net.Listen("tcp", listenAddr(self.GRPCAddr))
+		if err != nil {
+			log.Fatalf("failed to listen on gRPC address %s: %v", self.GRPCAddr, err)
+		}
+		go func() {
+			if err := gs.Serve(lis); err != nil {
+				log.Printf("gRPC server stopped: %v", err)
+			}
+		}()
+		defer gs.GracefulStop()
+	}
+	if mets != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", mets.Handler())
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
+		go func() {
+			if err := http.ListenAndServe(*metricsAddr, mux); err != nil {
+				log.Printf("metrics server stopped: %v", err)
+			}
+		}()
+	}
+
 	node.Start()
 	defer node.Stop()
+
+	if *noREPL {
+		fmt.Printf("node %s ready (no REPL) - cluster:%s client:%s grpc:%s metrics:%s - %d key(s) recovered\n",
+			*id, self.ClusterAddr, self.ClientAddr, self.GRPCAddr, *metricsAddr, fsm.Len())
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		return
+	}
 
 	fmt.Printf("node %s ready — cluster:%s client:%s — %d key(s) recovered from %s\n",
 		*id, self.ClusterAddr, self.ClientAddr, fsm.Len(), walPath)
@@ -157,4 +210,15 @@ func printClusterErr(node *raft.Node, cluster config.ClusterConfig, err error) {
 		return
 	}
 	fmt.Printf("error: %v\n", err)
+}
+
+// listenAddr turns an advertised address like "node1:9001" into ":9001", so
+// in Docker the node listens on all interfaces while peers dial it by name.
+// Loopback addresses (the local demo) are kept as they are.
+func listenAddr(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host == "" || host == "127.0.0.1" || host == "localhost" {
+		return addr
+	}
+	return ":" + port
 }

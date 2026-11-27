@@ -1,29 +1,30 @@
-// Package raft implements a deliberately simplified, Raft-style leader
-// election and replication protocol. It is not full Raft — see the
-// project README's "Raft guarantees provided vs. not provided" section for
-// the exact, honest list of what's cut. The goal is a version small enough
-// to fully understand and defend, not a partial copy of the paper.
+// Package raft implements a deliberately compact, Raft-style leader
+// election and replication protocol. It is not full Raft (no snapshots,
+// no membership changes, no pre-vote): see the README's "Raft guarantees"
+// section for the exact list. The goal is a version small enough to fully
+// understand and defend.
 //
-// Two simplifications worth calling out here specifically, since they
-// shape this file:
+// How this file is laid out:
 //
-//  1. The replicated log lives entirely in memory (Node.entries), mirrored
-//     one-for-one against the storage WAL (store.WAL) for durability. There
-//     is no random-access read-back from the WAL; on restart, the WAL's
-//     replayed records rebuild the in-memory log view once, and after that
-//     the two are kept in lockstep by every AppendRecord call.
-//  2. AppendEntries' consistency check only ever compares against a
-//     follower's LAST log entry, not an arbitrary index — so it correctly
-//     handles a follower whose log is a prefix of the leader's (behind, the
-//     common case), but does not handle a follower whose log has diverged
-//     to be AHEAD of the leader's (e.g. a former leader rejoining with an
-//     entry it appended to its own WAL but never got to replicate before
-//     crashing). That case is the paper's log-matching / conflicting-entry
-//     truncation machinery, which this project deliberately doesn't
-//     implement. In the scripted demo this never arises, because a
-//     Propose() call only ever returns after majority commit — so by the
-//     time an operator kills a node, everything in that node's log was
-//     already durable on at least one other node too.
+//  1. The replicated log lives in memory (Node.entries), mirrored one-for-one
+//     against the storage WAL (store.WAL) for durability. On restart the
+//     WAL's records rebuild the log, but are NOT treated as committed: an
+//     entry may never have reached a majority (a leader killed mid-write).
+//     commitIndex starts at 0 and entries are applied only once a leader
+//     confirms them.
+//  2. AppendEntries does full log matching: a follower checks the leader's
+//     entry at PrevLogIndex, and if its own log has a conflicting suffix
+//     (same index, different term), it deletes that uncommitted suffix
+//     (rewriting the WAL) and takes the leader's entries. A new leader
+//     appends a no-op entry so earlier-term entries get committed, and only
+//     serves reads once that no-op commits.
+//  3. Writes are group-committed: proposalLoop gives a batch of waiting
+//     writes consecutive indexes and fsyncs them once. Each peer has one
+//     replicator goroutine with at most one AppendEntries in flight.
+//
+// Points 1 and 2 were found missing by the chaos test (scripts/chaos.sh):
+// killing the leader under load left it with an uncommitted entry that it
+// applied on restart and could never reconcile.
 package raft
 
 import (
@@ -134,9 +135,26 @@ type Node struct {
 	commitIndex  uint64
 	lastApplied  uint64
 
+	// readyIndex is the index of the no-op entry this node appended when it
+	// became leader. Reads are only served once it is committed, so a new
+	// leader never answers from a state machine that is missing entries
+	// committed by an earlier leader.
+	readyIndex uint64
+	// lastContact is when this node last finished handling an
+	// AppendEntries from the current leader (see startElection).
+	lastContact time.Time
+
 	nextIndex     map[string]uint64 // leader-only, reset on becoming leader
 	matchIndex    map[string]uint64 // leader-only, reset on becoming leader
 	pendingWrites map[uint64]chan error
+
+	// replCh has one 1-slot channel per peer. A send means "this peer may
+	// need an AppendEntries"; the peer's replicator goroutine coalesces
+	// sends, so each peer has at most one AppendEntries in flight.
+	replCh map[string]chan struct{}
+	// proposeCh feeds client writes to proposalLoop, which appends whole
+	// batches with one fsync (group commit).
+	proposeCh chan proposal
 
 	resetElectionCh chan struct{}
 	stopCh          chan struct{}
@@ -204,36 +222,42 @@ func NewNode(p Params) (*Node, error) {
 	}
 
 	n := &Node{
-		id:                  p.ID,
-		peerAddrs:           p.PeerAddrs,
-		peerIDs:             peerIDs,
-		transport:           p.Transport,
-		stateStore:          p.StateStore,
-		wal:                 p.Store.WAL(),
-		fsm:                 p.Store,
-		heartbeatInterval:   heartbeat,
-		electionTimeoutMin:  minTO,
-		electionTimeoutMax:  maxTO,
-		proposeTimeout:      proposeTimeout,
-		rng:                 rand.New(rand.NewSource(seed)),
-		state:               Follower,
-		currentTerm:         currentTerm,
-		votedFor:            votedFor,
-		entries:             entries,
-		lastLogIndex:        lastLogIndex,
-		lastLogTerm:         lastLogTerm,
-		// Everything replayed from the WAL was already applied to the
-		// Store's map by OpenForRaft, so treat it as committed+applied.
-		// This is the restart-time counterpart of the divergence
-		// simplification described in the package doc.
-		commitIndex:   lastLogIndex,
-		lastApplied:   lastLogIndex,
+		id:                 p.ID,
+		peerAddrs:          p.PeerAddrs,
+		peerIDs:            peerIDs,
+		transport:          p.Transport,
+		stateStore:         p.StateStore,
+		wal:                p.Store.WAL(),
+		fsm:                p.Store,
+		heartbeatInterval:  heartbeat,
+		electionTimeoutMin: minTO,
+		electionTimeoutMax: maxTO,
+		proposeTimeout:     proposeTimeout,
+		rng:                rand.New(rand.NewSource(seed)),
+		state:              Follower,
+		currentTerm:        currentTerm,
+		votedFor:           votedFor,
+		entries:            entries,
+		lastLogIndex:       lastLogIndex,
+		lastLogTerm:        lastLogTerm,
+		// Replayed entries are NOT assumed committed: the last few may
+		// never have reached a majority (e.g. this node was a leader that
+		// was killed mid-write). commitIndex starts at 0 and is learned
+		// from the leader (or, if this node becomes leader, from its own
+		// no-op entry committing); entries are applied only then.
+		commitIndex:   0,
+		lastApplied:   0,
 		nextIndex:     make(map[string]uint64),
 		matchIndex:    make(map[string]uint64),
 		pendingWrites: make(map[uint64]chan error),
 
 		resetElectionCh: make(chan struct{}, 1),
 		stopCh:          make(chan struct{}),
+		replCh:          make(map[string]chan struct{}, len(peerIDs)),
+		proposeCh:       make(chan proposal, 4096),
+	}
+	for _, id := range peerIDs {
+		n.replCh[id] = make(chan struct{}, 1)
 	}
 	return n, nil
 }
@@ -243,6 +267,10 @@ func NewNode(p Params) (*Node, error) {
 func (n *Node) Start() {
 	go n.electionLoop()
 	go n.heartbeatLoop()
+	go n.proposalLoop()
+	for _, id := range n.peerIDs {
+		go n.peerReplicator(id)
+	}
 }
 
 // Stop halts the node's background loops. Safe to call more than once.
@@ -261,6 +289,15 @@ func (n *Node) State() State {
 }
 
 func (n *Node) IsLeader() bool { return n.State() == Leader }
+
+// IsReadyLeader reports whether this node is leader AND has committed its
+// no-op entry, i.e. its state machine includes every committed write, so
+// it is safe to serve reads.
+func (n *Node) IsReadyLeader() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.state == Leader && n.readyIndex > 0 && n.commitIndex >= n.readyIndex
+}
 
 func (n *Node) CurrentTerm() uint64 {
 	n.mu.Lock()
@@ -284,6 +321,14 @@ func (n *Node) LeaderAddr(clientAddrs map[string]string) string {
 		return clientAddrs[n.id]
 	}
 	return clientAddrs[id]
+}
+
+// LastLogIndex returns the index of the last entry in this node's log
+// (committed or not).
+func (n *Node) LastLogIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastLogIndex
 }
 
 // CommitIndex returns the highest committed log index, for status/demo output.
@@ -350,18 +395,46 @@ func (n *Node) heartbeatLoop() {
 	}
 }
 
+// triggerReplication asks every peer's replicator to send an
+// AppendEntries (heartbeat or new entries). Non-blocking: if a peer
+// already has a request pending, the signals merge into one.
 func (n *Node) triggerReplication() {
-	n.mu.Lock()
-	if n.state != Leader {
-		n.mu.Unlock()
-		return
+	for _, id := range n.peerIDs {
+		n.nudge(id)
 	}
-	term := n.currentTerm
-	peers := append([]string(nil), n.peerIDs...)
-	n.mu.Unlock()
+}
 
-	for _, peerID := range peers {
-		go n.replicateTo(peerID, term)
+func (n *Node) nudge(peerID string) {
+	select {
+	case n.replCh[peerID] <- struct{}{}:
+	default:
+	}
+}
+
+// peerReplicator owns all AppendEntries traffic to one peer: one request
+// at a time, each carrying everything the peer is missing (up to
+// maxEntriesPerAppend). If the peer is still behind afterwards, it goes
+// again right away instead of waiting for the next heartbeat.
+func (n *Node) peerReplicator(peerID string) {
+	for {
+		select {
+		case <-n.stopCh:
+			return
+		case <-n.replCh[peerID]:
+		}
+		n.mu.Lock()
+		leader, term := n.state == Leader, n.currentTerm
+		n.mu.Unlock()
+		if !leader {
+			continue
+		}
+		n.replicateTo(peerID, term)
+		n.mu.Lock()
+		behind := n.state == Leader && n.currentTerm == term && n.nextIndex[peerID] <= n.lastLogIndex
+		n.mu.Unlock()
+		if behind {
+			n.nudge(peerID)
+		}
 	}
 }
 
@@ -385,7 +458,11 @@ func (n *Node) replicateTo(peerID string, term uint64) {
 	}
 	var toSend []LogEntry
 	if next <= uint64(len(n.entries)) {
-		toSend = append([]LogEntry(nil), n.entries[next-1:]...)
+		end := uint64(len(n.entries))
+		if end-(next-1) > maxEntriesPerAppend {
+			end = next - 1 + maxEntriesPerAppend
+		}
+		toSend = append([]LogEntry(nil), n.entries[next-1:end]...)
 	}
 	args := AppendEntriesArgs{
 		Term:         term,
@@ -423,7 +500,16 @@ func (n *Node) replicateTo(peerID string, term uint64) {
 		}
 		n.maybeAdvanceCommitLocked()
 	} else {
-		n.nextIndex[peerID] = reply.LastLogIndex + 1
+		// The follower is behind or has a conflicting suffix; its reply
+		// says where its log can still match ours. Retry from there.
+		next := reply.LastLogIndex + 1
+		if next > n.lastLogIndex+1 {
+			next = n.lastLogIndex + 1
+		}
+		if next < 1 {
+			next = 1
+		}
+		n.nextIndex[peerID] = next // peerReplicator retries right away if still behind
 	}
 }
 
@@ -471,46 +557,108 @@ func (n *Node) applyCommittedLocked() {
 
 // --- client writes ---
 
-// Propose appends a new entry for (op, key, value) to the leader's log and
-// blocks until it is replicated to a majority (committed), the timeout
-// elapses, or this node stops being leader. Returns ErrNotLeader if this
+// Propose queues a new entry for (op, key, value) for the leader's log
+// (proposalLoop appends it, batched with other waiting writes) and blocks
+// until it is replicated to a majority (committed), the timeout elapses,
+// or this node stops being leader. Returns ErrNotLeader if this
 // node isn't currently the leader (checked both up front and if
 // leadership is lost while the write is in flight).
 func (n *Node) Propose(op, key, value string, timeout time.Duration) error {
-	n.mu.Lock()
-	if n.state != Leader {
-		n.mu.Unlock()
+	if !n.IsLeader() {
 		return ErrNotLeader
 	}
-
-	index := n.lastLogIndex + 1
-	term := n.currentTerm
-	entry := LogEntry{Index: index, Term: term, Op: op, Key: key, Value: value}
-
-	if err := n.wal.AppendRecord(store.Record{Index: index, Term: term, Op: op, Key: key, Value: value}); err != nil {
-		n.mu.Unlock()
-		return fmt.Errorf("raft: append to log: %w", err)
-	}
-	n.entries = append(n.entries, entry)
-	n.lastLogIndex = index
-	n.lastLogTerm = term
-	n.matchIndex[n.id] = index // the leader counts as one replica of its own entry
-
-	done := make(chan error, 1)
-	n.pendingWrites[index] = done
-	n.mu.Unlock()
-
-	n.triggerReplication()
-
 	if timeout <= 0 {
 		timeout = n.proposeTimeout
 	}
+	p := proposal{op: op, key: key, value: value, done: make(chan error, 1)}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
-	case err := <-done:
-		return err
-	case <-time.After(timeout):
+	case n.proposeCh <- p:
+	case <-n.stopCh:
+		return ErrNotLeader
+	case <-timer.C:
 		return ErrProposeTimeout
 	}
+	select {
+	case err := <-p.done:
+		return err
+	case <-timer.C:
+		return ErrProposeTimeout
+	}
+}
+
+type proposal struct {
+	op, key, value string
+	done           chan error
+}
+
+// maxProposalBatch caps how many client writes share one fsync.
+const maxProposalBatch = 256
+
+// proposalLoop is the leader's group commit: it takes every write that is
+// waiting (up to maxProposalBatch), gives them consecutive log indexes,
+// writes them to the WAL with ONE fsync, then hands them to replication.
+// Under load this turns N fsyncs into 1 and keeps the lock free for
+// heartbeats between batches.
+func (n *Node) proposalLoop() {
+	batch := make([]proposal, 0, maxProposalBatch)
+	for {
+		batch = batch[:0]
+		select {
+		case <-n.stopCh:
+			return
+		case p := <-n.proposeCh:
+			batch = append(batch, p)
+		}
+	drain:
+		for len(batch) < maxProposalBatch {
+			select {
+			case p := <-n.proposeCh:
+				batch = append(batch, p)
+			default:
+				break drain
+			}
+		}
+		n.appendBatch(batch)
+	}
+}
+
+func (n *Node) appendBatch(batch []proposal) {
+	n.mu.Lock()
+	if n.state != Leader {
+		n.mu.Unlock()
+		for _, p := range batch {
+			p.done <- ErrNotLeader
+		}
+		return
+	}
+	term := n.currentTerm
+	recs := make([]store.Record, len(batch))
+	entries := make([]LogEntry, len(batch))
+	for i, p := range batch {
+		index := n.lastLogIndex + 1 + uint64(i)
+		recs[i] = store.Record{Index: index, Term: term, Op: p.op, Key: p.key, Value: p.value}
+		entries[i] = LogEntry{Index: index, Term: term, Op: p.op, Key: p.key, Value: p.value}
+	}
+	if err := n.wal.AppendRecords(recs); err != nil {
+		n.mu.Unlock()
+		for _, p := range batch {
+			p.done <- fmt.Errorf("raft: append to log: %w", err)
+		}
+		return
+	}
+	n.entries = append(n.entries, entries...)
+	last := entries[len(entries)-1]
+	n.lastLogIndex, n.lastLogTerm = last.Index, last.Term
+	n.matchIndex[n.id] = last.Index // the leader counts as one replica of its own entries
+	for i, p := range batch {
+		n.pendingWrites[entries[i].Index] = p.done
+	}
+	n.maybeAdvanceCommitLocked() // a single-node cluster commits right away
+	n.mu.Unlock()
+
+	n.triggerReplication()
 }
 
 // --- election ---
@@ -519,6 +667,15 @@ func (n *Node) startElection() {
 	n.mu.Lock()
 	if n.state == Leader {
 		n.mu.Unlock()
+		return
+	}
+	// The timer can fire while an AppendEntries handler is still busy
+	// (e.g. a slow fsync on a big batch). If we heard from a live leader
+	// more recently than the minimum election timeout, it isn't dead:
+	// don't start an election that would only depose it.
+	if n.state == Follower && n.leaderID != "" && time.Since(n.lastContact) < n.electionTimeoutMin {
+		n.mu.Unlock()
+		n.resetElectionTimer()
 		return
 	}
 	n.state = Candidate
@@ -601,6 +758,22 @@ func (n *Node) becomeLeaderLocked() {
 	for _, peerID := range n.peerIDs {
 		n.nextIndex[peerID] = n.lastLogIndex + 1
 		n.matchIndex[peerID] = 0
+	}
+
+	// Append a no-op entry in the new term. A leader may only count
+	// replicas for entries of its own term (see maybeAdvanceCommitLocked),
+	// so committing this entry is what also commits everything before it,
+	// including entries a previous leader replicated but never committed.
+	index := n.lastLogIndex + 1
+	noop := LogEntry{Index: index, Term: n.currentTerm, Op: store.OpNoop}
+	if err := n.wal.AppendRecord(store.Record{Index: index, Term: n.currentTerm, Op: store.OpNoop}); err != nil {
+		log.Printf("[%s] failed to append no-op entry: %v", n.id, err)
+	} else {
+		n.entries = append(n.entries, noop)
+		n.lastLogIndex = index
+		n.lastLogTerm = n.currentTerm
+		n.matchIndex[n.id] = index
+		n.readyIndex = index
 	}
 
 	// Send an immediate round so followers don't sit out a full
@@ -692,40 +865,83 @@ func (n *Node) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		log.Printf("[%s] term=%d -> Follower (leader is %s)", n.id, n.currentTerm, args.LeaderID)
 	}
 	n.leaderID = args.LeaderID
+	n.lastContact = time.Now()
 	n.resetElectionTimer()
 
-	if args.PrevLogIndex != n.lastLogIndex || args.PrevLogTerm != n.lastLogTerm {
+	// Log matching: our log must contain the leader's entry at
+	// PrevLogIndex with the same term.
+	if args.PrevLogIndex > n.lastLogIndex {
 		reply.Success = false
-		reply.LastLogIndex = n.lastLogIndex
+		reply.LastLogIndex = n.lastLogIndex // we're behind: resend from our end
+		return reply
+	}
+	if args.PrevLogIndex >= 1 && n.entries[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		// Conflict: skip back over every entry of the conflicting term in
+		// one step, so the leader doesn't walk back one entry per RPC.
+		conflictTerm := n.entries[args.PrevLogIndex-1].Term
+		i := args.PrevLogIndex
+		for i > 1 && n.entries[i-2].Term == conflictTerm {
+			i--
+		}
+		reply.Success = false
+		reply.LastLogIndex = i - 1
 		return reply
 	}
 
-	for _, e := range args.Entries {
-		rec := store.Record{Index: e.Index, Term: e.Term, Op: e.Op, Key: e.Key, Value: e.Value}
-		if err := n.wal.AppendRecord(rec); err != nil {
-			log.Printf("[%s] failed to append replicated entry index=%d: %v", n.id, e.Index, err)
+	// Skip entries we already have; at the first entry whose term differs
+	// from ours at the same index, our entry (and everything after it) was
+	// never committed: drop that suffix and take the leader's entries.
+	newEntries := args.Entries
+	for len(newEntries) > 0 && newEntries[0].Index <= n.lastLogIndex {
+		e := newEntries[0]
+		if n.entries[e.Index-1].Term == e.Term {
+			newEntries = newEntries[1:] // already have it (a retried or overlapping RPC)
+			continue
+		}
+		if err := n.truncateFromLocked(e.Index); err != nil {
+			log.Printf("[%s] failed to truncate log from index %d: %v", n.id, e.Index, err)
 			reply.Success = false
 			reply.LastLogIndex = n.lastLogIndex
 			return reply
 		}
-		n.entries = append(n.entries, e)
-		n.lastLogIndex = e.Index
-		n.lastLogTerm = e.Term
+		break
 	}
-	if len(args.Entries) > 0 {
-		log.Printf("[%s] term=%d appended %d log entries from %s (lastLogIndex now %d)",
-			n.id, n.currentTerm, len(args.Entries), args.LeaderID, n.lastLogIndex)
-	}
-
-	if args.LeaderCommit > n.commitIndex {
-		if args.LeaderCommit < n.lastLogIndex {
-			n.commitIndex = args.LeaderCommit
-		} else {
-			n.commitIndex = n.lastLogIndex
+	appended := len(newEntries)
+	if appended > 0 {
+		recs := make([]store.Record, appended)
+		for i, e := range newEntries {
+			recs[i] = store.Record{Index: e.Index, Term: e.Term, Op: e.Op, Key: e.Key, Value: e.Value}
 		}
-		n.applyCommittedLocked()
+		if err := n.wal.AppendRecords(recs); err != nil { // one fsync for the whole batch
+			log.Printf("[%s] failed to append %d replicated entries: %v", n.id, appended, err)
+			reply.Success = false
+			reply.LastLogIndex = n.lastLogIndex
+			return reply
+		}
+		n.entries = append(n.entries, newEntries...)
+		last := newEntries[appended-1]
+		n.lastLogIndex, n.lastLogTerm = last.Index, last.Term
+	}
+	if appended > 0 {
+		log.Printf("[%s] term=%d appended %d log entries from %s (lastLogIndex now %d)",
+			n.id, n.currentTerm, appended, args.LeaderID, n.lastLogIndex)
 	}
 
+	// Only entries the leader just confirmed match its log may be marked
+	// committed; anything past them could still be a stale suffix.
+	lastNew := args.PrevLogIndex + uint64(len(args.Entries))
+	if args.LeaderCommit > n.commitIndex {
+		c := args.LeaderCommit
+		if c > lastNew {
+			c = lastNew
+		}
+		if c > n.commitIndex {
+			n.commitIndex = c
+			n.applyCommittedLocked()
+		}
+	}
+
+	n.lastContact = time.Now() // after the fsync, so a slow disk doesn't look like a dead leader
 	reply.Success = true
 	reply.LastLogIndex = n.lastLogIndex
 	return reply
@@ -802,4 +1018,34 @@ func (n *Node) HandleMessage(msg transport.Message) (transport.Message, error) {
 	default:
 		return transport.Message{}, fmt.Errorf("raft: unknown message type %q", msg.Type)
 	}
+}
+
+// maxEntriesPerAppend caps one AppendEntries batch, so a follower that was
+// down for a long time catches up in bounded-size steps.
+const maxEntriesPerAppend = 512
+
+// truncateFromLocked assumes n.mu is held. It deletes log entries from
+// index onward, in memory and on disk. Only uncommitted entries may be
+// removed; Raft guarantees a committed entry never conflicts with the
+// leader, so hitting a committed one means a bug, and we refuse.
+func (n *Node) truncateFromLocked(index uint64) error {
+	if index <= n.commitIndex {
+		return fmt.Errorf("raft: refusing to truncate committed entry %d (commitIndex %d)", index, n.commitIndex)
+	}
+	keep := n.entries[:index-1]
+	recs := make([]store.Record, len(keep))
+	for i, e := range keep {
+		recs[i] = store.Record{Index: e.Index, Term: e.Term, Op: e.Op, Key: e.Key, Value: e.Value}
+	}
+	if err := n.wal.Rewrite(recs); err != nil {
+		return err
+	}
+	log.Printf("[%s] term=%d dropped %d uncommitted log entries from index %d (conflict with leader)",
+		n.id, n.currentTerm, len(n.entries)-len(keep), index)
+	n.entries = append([]LogEntry(nil), keep...)
+	n.lastLogIndex, n.lastLogTerm = 0, 0
+	if k := len(keep); k > 0 {
+		n.lastLogIndex, n.lastLogTerm = keep[k-1].Index, keep[k-1].Term
+	}
+	return nil
 }

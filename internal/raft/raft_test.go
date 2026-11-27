@@ -391,11 +391,22 @@ func TestRestartedNodeCatchesUp(t *testing.T) {
 	}
 	t.Cleanup(func() { s2.Close() })
 
-	if got, ok := s2.Get("k1"); !ok || got != "v1" {
-		t.Fatalf("restarted %s's replayed WAL missing k1: got %q, ok=%v", victimID, got, ok)
+	// k1 must be on disk, k2 must not (the node was down for it). Neither is
+	// applied yet: a restarted node only applies entries once the leader
+	// confirms they are committed.
+	hasK1, hasK2 := false, false
+	for _, r := range records2 {
+		hasK1 = hasK1 || (r.Key == "k1" && r.Value == "v1")
+		hasK2 = hasK2 || r.Key == "k2"
 	}
-	if _, ok := s2.Get("k2"); ok {
-		t.Fatalf("restarted %s's replayed WAL already has k2, which it should have missed while down", victimID)
+	if !hasK1 {
+		t.Fatalf("restarted %s's WAL is missing k1", victimID)
+	}
+	if hasK2 {
+		t.Fatalf("restarted %s's WAL already has k2, which it should have missed while down", victimID)
+	}
+	if _, ok := s2.Get("k1"); ok {
+		t.Fatalf("restarted %s applied k1 before learning it was committed", victimID)
 	}
 
 	restarted, err := NewNode(Params{
@@ -416,6 +427,7 @@ func TestRestartedNodeCatchesUp(t *testing.T) {
 	restarted.Start()
 	t.Cleanup(restarted.Stop)
 
+	waitForApplied(t, s2, "k1", "v1", 2*time.Second)
 	waitForApplied(t, s2, "k2", "v2", 2*time.Second)
-	t.Logf("restarted node %s caught up on k2 after rejoining", victimID)
+	t.Logf("restarted node %s caught up on k1 and k2 after rejoining", victimID)
 }

@@ -1,29 +1,96 @@
 # dist-key-value-store
 
-A minimal distributed key-value store in Go, built from scratch as an interview
-project. It is intentionally scoped to be a **simplified Raft-style system I deeply
-understand**, not a partial copy of the full Raft paper. See
+A distributed key-value store in Go, built from scratch: a write-ahead log, a
+Raft-style replicated log with leader election, a gRPC API, Prometheus metrics,
+a Docker cluster, k6 load tests and a chaos test that kills the leader under
+load. It is intentionally a **compact Raft-style system I deeply understand**,
+not a copy of the full Raft paper; see
 [Raft guarantees: provided vs. not provided](#raft-guarantees-provided-vs-not-provided)
 for exactly where the line is drawn.
 
-Four things this project demonstrates:
+## Results (Docker on a MacBook, 3 nodes, every write fsynced)
 
-1. **Storage engine** ([`internal/store`](internal/store)) -- in-memory map + write-ahead
-   log (WAL). Every write hits the WAL (with `fsync`) before memory. Startup replays
-   the WAL; a torn or corrupted final record is detected via checksum and safely
-   truncated, not replayed.
-2. **Concurrency correctness** -- `sync.RWMutex`-guarded store, verified with a
-   100-goroutine mixed get/put/delete test under `go test -race`.
-3. **Leader election + replication** ([`internal/raft`](internal/raft)) -- a
-   simplified Raft: terms, randomized election timeouts, `RequestVote`, heartbeat
-   `AppendEntries`, majority-committed writes replicated from leader to followers,
-   and rejoin/catch-up for a node that comes back after being down.
-4. **Node communication** ([`internal/transport`](internal/transport)) -- plain TCP
-   with length-prefixed JSON framing (no gRPC/protobuf -- see
-   [Design Decisions](#design-decisions)), timeouts on every RPC, and clean handling
-   of a peer disappearing mid-connection.
+| Test | Result |
+|---|---|
+| **Chaos**: 16 writers for 40 s, leader hard-killed (`SIGKILL`) at 10 s, restarted at 25 s, 3 rounds in a row | **0 acknowledged writes lost** (~41,000 per round, ~1,000 writes/s), failover 0.4-1.1 s, all 3 nodes converge every round |
+| **k6** gRPC load, 32 virtual users, Put + Get | 1,182 Put+Get pairs/s, p95 24 ms, 100% success |
+| **k6**, 64 virtual users | 2,068 Put+Get pairs/s (~4,100 requests/s), p95 27.5 ms, 100% success |
+| **Group commit** (same k6 test, 32 users) | before: 395 pairs/s, p95 76 ms, and a spurious leader election under load; after: 3x throughput, p95 24 ms, no elections |
 
-Everything runs natively on Windows via PowerShell -- no bash, no Makefiles.
+Numbers are from `scripts/chaos.sh` and `scripts/k6.sh` on Docker Desktop; they
+depend on the machine's fsync speed.
+
+## What the chaos test found
+
+The first version passed every unit test and the scripted demo, because the demo
+only kills a node while nothing is being written. Killing the leader **under
+load** showed three real problems:
+
+1. **A restarted leader applied writes that were never committed.** A leader that
+   is killed right after appending a write to its own WAL, before any follower has
+   it, used to replay its whole WAL on restart *as if it were committed*. It then
+   held keys no other node had (16 extra keys in one run).
+2. **That node could never catch up**, because AppendEntries only compared against
+   the follower's last entry, so a follower with a conflicting suffix was stuck
+   forever. After two leader kills there was no longer a majority that could accept
+   writes, so the cluster stopped accepting them.
+3. **Under load, the leader missed heartbeats** (one fsync per write while holding
+   the node's lock, plus one new RPC per write per follower), so followers started
+   elections and deposed a healthy leader.
+
+Fixes (each covered by a test in `internal/raft/conflict_test.go` or
+`internal/store/rewrite_test.go`):
+
+- **Commit before apply**: on restart, WAL entries rebuild the log but are applied
+  only once a leader confirms they are committed.
+- **Log matching with conflict truncation**: a follower checks the leader's entry at
+  `PrevLogIndex`; on a term conflict it drops its uncommitted suffix (atomic WAL
+  rewrite: temp file, fsync, rename, fsync dir) and takes the leader's entries.
+  Conflicts skip back a whole term at a time.
+- **No-op entry on election**: a new leader commits a no-op in its own term (which
+  commits everything before it) and serves reads only after that.
+- **Group commit + one replicator per follower**: waiting writes share one fsync;
+  each follower has at most one AppendEntries in flight, batched (max 512 entries,
+  one fsync per batch on the follower too).
+- **No elections right after hearing from the leader**: a follower whose election
+  timer fires while it is still busy with a slow fsync doesn't depose a live leader.
+
+## What's in the repo
+
+1. **Storage engine** ([`internal/store`](internal/store)): in-memory map + write-ahead
+   log (WAL). Every write is fsynced before it is acknowledged. Startup replays the
+   WAL; a torn or corrupted final record is detected via checksum and truncated.
+2. **Raft-style replication** ([`internal/raft`](internal/raft)): terms, randomized
+   election timeouts, `RequestVote`, `AppendEntries` with log matching and conflict
+   truncation, majority commit, a no-op entry on election, group commit.
+3. **gRPC API** ([`proto/kv/v1/kv.proto`](proto/kv/v1/kv.proto),
+   [`internal/grpcapi`](internal/grpcapi)): `Put`, `Get`, `Delete`, `Status`. A
+   follower answers `FAILED_PRECONDITION` with the leader's address in the
+   `x-leader-addr` header. The original TCP + JSON client port still works.
+4. **Metrics** ([`internal/metrics`](internal/metrics)): Prometheus `/metrics` with
+   request rate and latency by method and status code, Raft term / leader / commit
+   index, keys, and WAL fsync latency; a Grafana dashboard is provisioned.
+5. **Docker** ([`Dockerfile`](Dockerfile), [`deploy/`](deploy)): a 3-node cluster plus
+   Prometheus and Grafana with one `docker compose up`.
+6. **Load and chaos tests**: [`load/k6-kv.js`](load/k6-kv.js) (k6 gRPC load test) and
+   [`cmd/kvchaos`](cmd/kvchaos) + [`scripts/chaos.sh`](scripts/chaos.sh) (leader kill
+   under load, then checks every acknowledged write and node convergence).
+7. **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): vet, unit tests
+   under the race detector, and the Docker chaos test on every push.
+
+## Quick start (macOS / Linux, Docker)
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d --build   # 3 nodes + Prometheus + Grafana
+./scripts/chaos.sh                                          # kill the leader under load
+./scripts/k6.sh                                             # k6 gRPC load test (VUS=64 ./scripts/k6.sh)
+```
+
+- Grafana: http://localhost:3001 (dashboard "KV cluster"), Prometheus: http://localhost:9090
+- gRPC: `localhost:9001-9003`; metrics: `localhost:2112-2114/metrics`
+- Reset all data: `docker compose -f deploy/docker-compose.yml down -v`
+
+The original Windows/PowerShell demo below still works unchanged.
 
 ## Requirements
 
@@ -106,7 +173,8 @@ rebuilds both the KV map and Raft's view of its own log in one pass. See
 
 ## Wire protocol
 
-All node-to-node and client-to-node traffic uses the same framing
+Clients can use gRPC (`proto/kv/v1/kv.proto`, see above). Node-to-node Raft RPCs
+and the original TCP client port use the same simple framing
 (`internal/transport/protocol.go`):
 
 ```
@@ -164,6 +232,10 @@ Each of these was independently runnable and demoable on its own:
 5. **Replication + rejoin/catch-up** -- real log entries, majority commit, apply to
    state machine, leader-only client API with redirect, a restarted node catching up.
 6. **Demo scripts + README** -- this file, `scripts\demo.ps1`.
+7. **Production-style tooling + chaos fixes** -- gRPC API, Prometheus/Grafana,
+   Docker Compose cluster, k6 load test, leader-kill chaos test in CI; then the
+   fixes the chaos test forced (commit-before-apply, conflict truncation, no-op on
+   election, group commit, per-follower replicators).
 
 ## Test strategy
 
@@ -197,33 +269,34 @@ demo, while still failing over in well under a second.
 ## Raft guarantees: provided vs. not provided
 
 **Provided:**
-- Leader election with terms, randomized election timeouts, majority voting
+- Leader election with terms, randomized election timeouts, majority voting, and
+  the up-to-date-log rule (a node votes only for a candidate whose log is at least
+  as up to date as its own)
 - Heartbeat-based leader liveness (`AppendEntries` with no entries)
-- Log replication with a consistency check (`PrevLogIndex`/`PrevLogTerm`) before a
-  follower accepts new entries
-- Majority-acknowledged commits (leader only acks a client write once a majority of
-  nodes -- leader included -- have it durably in their WAL)
-- Persisted `currentTerm`/`votedFor` across restarts, so a crashed-and-restarted
-  node cannot double-vote within a term it already saw
-- Catch-up for a rejoining/stale follower via a simplified nextIndex backoff
+- Log replication with full log matching (`PrevLogIndex`/`PrevLogTerm` at any
+  index) and **conflict truncation** of a follower's uncommitted suffix
+- Majority-acknowledged commits (a client write is acknowledged only once a
+  majority of nodes, leader included, have it fsynced in their WAL), and only
+  entries from the leader's own term are committed by counting replicas
+- A **no-op entry** on election, so earlier-term entries commit; reads are served
+  only after the leader's no-op commits
+- Commit-before-apply on restart (WAL entries are not assumed committed)
+- Persisted `currentTerm`/`votedFor` across restarts, so a restarted node cannot
+  double-vote within a term it already saw
+- Catch-up for a rejoining or stale follower in bounded batches
 
 **Not provided (explicitly out of scope):**
-- Log compaction/snapshotting -- the log grows unbounded; fine for a demo, not
-  production
-- Cluster membership changes -- the 3-node set is fixed at startup
-- The Raft paper's full log-matching backtracking optimization -- we use simple
-  decrement-and-retry, and (see `internal/raft`'s package doc) don't handle a
-  follower whose log has diverged to be *ahead* of the leader's (e.g. a former
-  leader rejoining with an entry it never got to replicate before crashing) --
-  the scripted demo never hits this, because `Propose` only returns after majority
-  commit, so by the time an operator kills a node, everything in its log was
-  already durable on at least one other node too
-- Linearizable read guarantees -- leader-local reads are safe in the common case,
-  but there's no read-index/lease mechanism to formally prove it under all
-  leader-doubt scenarios
-- Pre-vote extension -- a partitioned minority node can still increment its term
-  and disrupt the cluster when the partition heals
-- Byzantine fault tolerance / split-brain beyond term+majority logic
+- Log compaction/snapshotting: the log grows without bound, and a conflict
+  truncation rewrites the whole WAL file (fine at this size, not for production)
+- Cluster membership changes: the 3-node set is fixed at startup
+- Linearizable reads under every leader-doubt scenario: reads go to the leader
+  after its no-op commits, but there's no read-index/lease check, so a deposed
+  leader that hasn't noticed yet could briefly serve a stale read
+- Pre-vote: a node cut off from the leader can still raise its term and force an
+  election when it reconnects
+- Exactly-once writes: a client retry after an unclear failure (timeout) may apply
+  the same put twice; puts are idempotent, so the final value is the same
+- Byzantine faults
 
 ## Windows-specific notes
 

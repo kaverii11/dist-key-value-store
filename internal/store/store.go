@@ -23,8 +23,17 @@ func Open(path string) (*Store, error) {
 // raft.Node can rebuild its in-memory log view (index/term per entry)
 // without re-parsing the WAL itself. Used for clustered nodes; standalone
 // use should call Open.
+//
+// Unlike Open, the replayed records are NOT applied to the map: under Raft,
+// an entry on disk may never have been committed (e.g. a leader that was
+// killed before replicating it), so the raft layer applies entries only
+// once it learns they are committed.
 func OpenForRaft(path string) (*Store, []Record, error) {
-	return openAndReplay(path)
+	wal, records, err := OpenWAL(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &Store{data: make(map[string]string), wal: wal}, records, nil
 }
 
 func openAndReplay(path string) (*Store, []Record, error) {
