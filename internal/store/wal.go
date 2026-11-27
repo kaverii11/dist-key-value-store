@@ -11,12 +11,22 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
+	"time"
 )
+
+// OnFsync, if set, is called with the duration of every WAL fsync. It lets
+// the metrics package record fsync latency without this package depending
+// on Prometheus. Set it once at startup, before any writes.
+var OnFsync func(time.Duration)
 
 const (
 	OpPut    = "PUT"
 	OpDelete = "DELETE"
+	// OpNoop is the empty entry a new Raft leader appends to commit
+	// entries from earlier terms. Applying it changes nothing.
+	OpNoop = "NOOP"
 )
 
 // Record is a single WAL entry. Index/Term double as the Raft log
@@ -171,13 +181,56 @@ func (w *WAL) AppendRecord(rec Record) error {
 	if _, err := w.file.Write(payload); err != nil {
 		return fmt.Errorf("wal: write payload: %w", err)
 	}
+	start := time.Now()
 	if err := w.file.Sync(); err != nil {
 		return fmt.Errorf("wal: fsync: %w", err)
+	}
+	if OnFsync != nil {
+		OnFsync(time.Since(start))
 	}
 
 	if rec.Index > w.lastIndex {
 		w.lastIndex = rec.Index
 		w.lastTerm = rec.Term
+	}
+	return nil
+}
+
+// AppendRecords writes several fully-formed records with a single fsync
+// at the end (group commit). A follower uses it to store a whole
+// AppendEntries batch at once instead of paying one fsync per entry.
+func (w *WAL) AppendRecords(recs []Record) error {
+	if len(recs) == 0 {
+		return nil
+	}
+	var buf []byte
+	for _, rec := range recs {
+		rec.CRC32 = checksum(rec)
+		payload, err := json.Marshal(rec)
+		if err != nil {
+			return fmt.Errorf("wal: marshal record: %w", err)
+		}
+		lenBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
+		buf = append(buf, lenBuf...)
+		buf = append(buf, payload...)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, err := w.file.Write(buf); err != nil {
+		return fmt.Errorf("wal: write batch: %w", err)
+	}
+	start := time.Now()
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("wal: fsync: %w", err)
+	}
+	if OnFsync != nil {
+		OnFsync(time.Since(start))
+	}
+	last := recs[len(recs)-1]
+	if last.Index > w.lastIndex {
+		w.lastIndex, w.lastTerm = last.Index, last.Term
 	}
 	return nil
 }
@@ -196,6 +249,70 @@ func (w *WAL) LastTerm() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.lastTerm
+}
+
+// Rewrite atomically replaces the whole log with records: it writes them
+// to a temp file, fsyncs it, renames it over the WAL and fsyncs the
+// directory, so a crash leaves either the old log or the new one, never a
+// mix. Raft uses it to drop a follower's conflicting, uncommitted tail.
+// It costs O(log size), which is fine because it only happens after a
+// leader change left a follower with entries the new leader doesn't have.
+func (w *WAL) Rewrite(records []Record) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	path := w.file.Name()
+	tmpPath := path + ".rewrite"
+	tmp, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("wal: rewrite: create temp: %w", err)
+	}
+	bw := bufio.NewWriter(tmp)
+	for _, rec := range records {
+		rec.CRC32 = checksum(rec)
+		payload, err := json.Marshal(rec)
+		if err != nil {
+			tmp.Close()
+			return fmt.Errorf("wal: rewrite: marshal: %w", err)
+		}
+		lenBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
+		if _, err := bw.Write(lenBuf); err != nil {
+			tmp.Close()
+			return fmt.Errorf("wal: rewrite: write: %w", err)
+		}
+		if _, err := bw.Write(payload); err != nil {
+			tmp.Close()
+			return fmt.Errorf("wal: rewrite: write: %w", err)
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("wal: rewrite: flush: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("wal: rewrite: fsync: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		tmp.Close()
+		return fmt.Errorf("wal: rewrite: rename: %w", err)
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync() // make the rename itself durable
+		dir.Close()
+	}
+	if _, err := tmp.Seek(0, io.SeekEnd); err != nil {
+		tmp.Close()
+		return fmt.Errorf("wal: rewrite: seek: %w", err)
+	}
+	w.file.Close()
+	w.file = tmp
+	w.lastIndex, w.lastTerm = 0, 0
+	if n := len(records); n > 0 {
+		w.lastIndex, w.lastTerm = records[n-1].Index, records[n-1].Term
+	}
+	return nil
 }
 
 func (w *WAL) Close() error {

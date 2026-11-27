@@ -17,6 +17,8 @@ type NodeConfig struct {
 	ID          string `json:"id"`
 	ClusterAddr string `json:"clusterAddr"`
 	ClientAddr  string `json:"clientAddr"`
+	// GRPCAddr is optional: the node's gRPC client API (see proto/kv/v1).
+	GRPCAddr string `json:"grpcAddr,omitempty"`
 }
 
 type ClusterConfig struct {
@@ -67,6 +69,18 @@ func (c ClusterConfig) ClientAddrs() map[string]string {
 	m := make(map[string]string, len(c.Nodes))
 	for _, n := range c.Nodes {
 		m[n.ID] = n.ClientAddr
+	}
+	return m
+}
+
+// GRPCAddrs returns id -> gRPC address for every node that has one, used to
+// resolve the leader's gRPC address for a not-leader reply.
+func (c ClusterConfig) GRPCAddrs() map[string]string {
+	m := make(map[string]string, len(c.Nodes))
+	for _, n := range c.Nodes {
+		if n.GRPCAddr != "" {
+			m[n.ID] = n.GRPCAddr
+		}
 	}
 	return m
 }

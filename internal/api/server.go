@@ -75,6 +75,18 @@ func (s *Server) Get(key string) (value string, found bool, err error) {
 	if !s.node.IsLeader() {
 		return "", false, raft.ErrNotLeader
 	}
+	// A brand-new leader may not have applied every committed entry yet;
+	// wait (briefly) until its no-op entry commits before answering.
+	deadline := time.Now().Add(s.proposeTimeout)
+	for !s.node.IsReadyLeader() {
+		if !s.node.IsLeader() {
+			return "", false, raft.ErrNotLeader
+		}
+		if time.Now().After(deadline) {
+			return "", false, raft.ErrProposeTimeout
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	v, ok := s.fsm.Get(key)
 	return v, ok, nil
 }

@@ -1,0 +1,7 @@
+{
+    "nodes": [
+        { "id": "node1", "clusterAddr": "node1:7001", "clientAddr": "node1:8001", "grpcAddr": "node1:9001" },
+        { "id": "node2", "clusterAddr": "node2:7002", "clientAddr": "node2:8002", "grpcAddr": "node2:9002" },
+        { "id": "node3", "clusterAddr": "node3:7003", "clientAddr": "node3:8003", "grpcAddr": "node3:9003" }
+    ]
+}
